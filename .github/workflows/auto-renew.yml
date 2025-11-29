@@ -29,7 +29,7 @@ jobs:
         
     - name: Run auto renewal
       env:
-        REMEMBER_WEB_COOKIE: ${{ secrets.REMEMBER_WEB_COOKIE }}
+        WEIRDHOST_COOKIES: ${{ secrets.WEIRDHOST_COOKIES }}  # 修改这里
         WEIRDHOST_EMAIL: ${{ secrets.WEIRDHOST_EMAIL }}
         WEIRDHOST_PASSWORD: ${{ secrets.WEIRDHOST_PASSWORD }}
         WEIRDHOST_SERVER_URLS: ${{ secrets.WEIRDHOST_SERVER_URLS }}
