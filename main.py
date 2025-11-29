@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Weirdhost 登录脚本 - GitHub Actions 版本
-修正版 - 只有点击按钮后出现错误消息才表示已续期
+修正版 - 修复Cookie处理问题
 """
 
 import os
@@ -16,11 +16,11 @@ class WeirdhostLogin:
     def __init__(self):
         """初始化，从环境变量读取配置"""
         self.url = os.getenv('WEIRDHOST_URL', 'https://hub.weirdhost.xyz')
-        self.server_urls = os.getenv('WEIRDHOST_SERVER_URLS', 'https://hub.weirdhost.xyz/server/d54a8070/')
+        self.server_urls = os.getenv('WEIRDHOST_SERVER_URLS', '')
         self.login_url = os.getenv('WEIRDHOST_LOGIN_URL', 'https://hub.weirdhost.xyz/auth/login')
         
-        # 获取认证信息
-        self.remember_web_cookie = os.getenv('REMEMBER_WEB_COOKIE', '')
+        # 获取认证信息 - 修复Cookie获取方式
+        self.cookies_str = os.getenv('WEIRDHOST_COOKIES', '')
         self.email = os.getenv('WEIRDHOST_EMAIL', '')
         self.password = os.getenv('WEIRDHOST_PASSWORD', '')
         
@@ -31,6 +31,23 @@ class WeirdhostLogin:
         self.server_list = []
         if self.server_urls:
             self.server_list = [url.strip() for url in self.server_urls.split(',') if url.strip()]
+        
+        # 解析Cookie字符串
+        self.cookies_dict = self.parse_cookies(self.cookies_str)
+    
+    def parse_cookies(self, cookies_str):
+        """解析Cookie字符串"""
+        cookies = {}
+        if not cookies_str:
+            return cookies
+            
+        for cookie in cookies_str.split(';'):
+            cookie = cookie.strip()
+            if '=' in cookie:
+                key, value = cookie.split('=', 1)
+                cookies[key] = value
+                
+        return cookies
     
     def log(self, message, level="INFO"):
         """日志输出"""
@@ -39,7 +56,7 @@ class WeirdhostLogin:
     
     def has_cookie_auth(self):
         """检查是否有 cookie 认证信息"""
-        return bool(self.remember_web_cookie)
+        return bool(self.cookies_dict)
     
     def has_email_auth(self):
         """检查是否有邮箱密码认证信息"""
@@ -50,12 +67,15 @@ class WeirdhostLogin:
         try:
             self.log("检查登录状态...")
             
-            # 简单检查：如果URL包含login或auth，说明未登录
-            if "login" in page.url or "auth" in page.url:
-                self.log("当前在登录页面，未登录")
+            # 检查页面内容判断登录状态
+            page_content = page.content().lower()
+            
+            # 如果页面包含登录相关元素，说明未登录
+            if any(text in page_content for text in ['login', 'sign in', '登录', 'email', 'password', 'username']):
+                self.log("检测到登录页面元素，未登录")
                 return False
             else:
-                self.log("不在登录页面，判断为已登录")
+                self.log("未检测到登录页面元素，判断为已登录")
                 return True
                 
         except Exception as e:
@@ -63,25 +83,37 @@ class WeirdhostLogin:
             return False
     
     def login_with_cookies(self, context):
-        """使用 Cookies 登录"""
+        """使用 Cookies 登录 - 修复版"""
         try:
             self.log("尝试使用 Cookies 登录...")
             
-            # 创建cookie
-            session_cookie = {
-                'name': 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d',
-                'value': self.remember_web_cookie,
-                'domain': 'hub.weirdhost.xyz',
-                'path': '/',
-                'expires': int(time.time()) + 3600 * 24 * 365,
-                'httpOnly': True,
-                'secure': True,
-                'sameSite': 'Lax'
-            }
+            if not self.cookies_dict:
+                self.log("没有可用的Cookie信息", "ERROR")
+                return False
             
-            context.add_cookies([session_cookie])
-            self.log("已添加 remember_web cookie")
-            return True
+            cookies_to_add = []
+            
+            # 添加所有解析到的Cookie
+            for name, value in self.cookies_dict.items():
+                cookie = {
+                    'name': name,
+                    'value': value,
+                    'domain': 'hub.weirdhost.xyz',
+                    'path': '/',
+                    'httpOnly': True,
+                    'secure': True,
+                    'sameSite': 'Lax'
+                }
+                cookies_to_add.append(cookie)
+                self.log(f"已添加 {name} cookie")
+            
+            if cookies_to_add:
+                context.add_cookies(cookies_to_add)
+                self.log(f"成功添加 {len(cookies_to_add)} 个Cookie")
+                return True
+            else:
+                self.log("没有有效的Cookie可添加", "ERROR")
+                return False
                 
         except Exception as e:
             self.log(f"设置 Cookies 时出错: {e}", "ERROR")
@@ -96,237 +128,67 @@ class WeirdhostLogin:
             self.log(f"访问登录页面: {self.login_url}")
             page.goto(self.login_url, wait_until="domcontentloaded")
             
-            # 使用固定选择器
-            email_selector = 'input[name="username"]'
-            password_selector = 'input[name="password"]'
-            login_button_selector = 'button[type="submit"]'
+            # 使用多种可能的选择器
+            email_selectors = ['input[name="username"]', 'input[name="email"]', 'input[type="email"]']
+            password_selectors = ['input[name="password"]', 'input[type="password"]']
+            login_button_selectors = ['button[type="submit"]', 'button:has-text("Login")', 'button:has-text("登录")']
             
-            # 等待元素加载
-            self.log("等待登录表单元素加载...")
-            page.wait_for_selector(email_selector)
-            page.wait_for_selector(password_selector)
-            page.wait_for_selector(login_button_selector)
+            # 查找有效的选择器
+            email_field = None
+            password_field = None
+            login_button = None
+            
+            for selector in email_selectors:
+                try:
+                    email_field = page.locator(selector)
+                    if email_field.count() > 0:
+                        break
+                except:
+                    continue
+            
+            for selector in password_selectors:
+                try:
+                    password_field = page.locator(selector)
+                    if password_field.count() > 0:
+                        break
+                except:
+                    continue
+            
+            for selector in login_button_selectors:
+                try:
+                    login_button = page.locator(selector)
+                    if login_button.count() > 0:
+                        break
+                except:
+                    continue
+            
+            if not email_field or not password_field or not login_button:
+                self.log("找不到登录表单元素", "ERROR")
+                return False
             
             # 填写登录信息
             self.log("填写邮箱和密码...")
-            page.fill(email_selector, self.email)
-            page.fill(password_selector, self.password)
+            email_field.fill(self.email)
+            password_field.fill(self.password)
             
             # 点击登录并等待导航
             self.log("点击登录按钮...")
-            with page.expect_navigation(wait_until="domcontentloaded", timeout=90000):
-                page.click(login_button_selector)
+            with page.expect_navigation(wait_until="domcontentloaded", timeout=30000):
+                login_button.click()
             
             # 检查登录是否成功
-            if "login" in page.url or "auth" in page.url:
-                self.log("邮箱密码登录失败，仍在登录页面", "ERROR")
-                return False
-            else:
+            time.sleep(3)  # 等待页面稳定
+            if self.check_login_status(page):
                 self.log("邮箱密码登录成功！")
                 return True
+            else:
+                self.log("邮箱密码登录失败", "ERROR")
+                return False
                 
         except Exception as e:
             self.log(f"邮箱密码登录时出错: {e}", "ERROR")
             return False
     
-    def add_server_time(self, page, server_url):
-        """添加服务器时间（续期）"""
-        try:
-            server_id = server_url.split('/')[-1]
-            self.log(f"开始处理服务器 {server_id}")
-            
-            # 访问服务器页面 - 使用更严格的等待条件
-            self.log(f"访问服务器页面: {server_url}")
-            page.goto(server_url, wait_until="networkidle")
-            
-            # 多重等待策略确保页面完全加载
-            self.wait_for_page_ready(page, server_id)
-            
-            # 使用更可靠的查找方法
-            button = self.find_renew_button(page, server_id)
-            
-            if not button:
-                return f"{server_id}: no_button_found"
-            
-            # 点击按钮并处理结果
-            return self.click_and_check_result(page, button, server_id)
-                
-        except Exception as e:
-            self.log(f"❌ 服务器 {server_id} 处理过程中出错: {e}")
-            return f"{server_id}: error"
-
-    def wait_for_page_ready(self, page, server_id):
-        """等待页面完全就绪"""
-        # 等待主要内容区域加载
-        try:
-            page.wait_for_selector('.server-details, .server-info, .card, .panel', timeout=10000)
-            self.log(f"✅ 服务器 {server_id} 主要内容已加载")
-        except:
-            self.log(f"⚠️ 服务器 {server_id} 未找到主要内容区域")
-        
-        # 等待所有图片加载完成
-        try:
-            page.wait_for_load_state('networkidle', timeout=15000)
-            self.log(f"✅ 服务器 {server_id} 网络空闲")
-        except:
-            self.log(f"⚠️ 服务器 {server_id} 网络未完全空闲")
-        
-        # 额外等待时间确保动态内容加载
-        time.sleep(3)
-
-    def find_renew_button(self, page, server_id):
-        """查找续期按钮 - 使用多种方法"""
-        selectors = [
-            'button:has-text("시간추가")',
-            'button:has-text("시간 추가")',
-            '//button[contains(text(), "시간추가")]',
-            '//button[contains(text(), "시간 추가")]',
-        ]
-        
-        for selector in selectors:
-            try:
-                if selector.startswith('//'):
-                    button = page.locator(f'xpath={selector}')
-                else:
-                    button = page.locator(selector)
-                
-                # 使用更严格的可见性检查
-                button.wait_for(state='visible', timeout=10000)
-                
-                if button.is_visible():
-                    self.log(f"✅ 服务器 {server_id} 找到按钮: {selector}")
-                    return button
-                    
-            except Exception as e:
-                continue
-        
-        # 如果上述方法都失败，尝试更广泛的搜索
-        return self.find_button_alternative_methods(page, server_id)
-
-    def find_button_alternative_methods(self, page, server_id):
-        """备用的按钮查找方法"""
-        # 方法1: 查找所有按钮并筛选
-        try:
-            all_buttons = page.locator('button')
-            button_count = all_buttons.count()
-            
-            for i in range(button_count):
-                try:
-                    button = all_buttons.nth(i)
-                    if button.is_visible():
-                        text = button.text_content().strip()
-                        if "시간" in text:
-                            self.log(f"✅ 服务器 {server_id} 通过文本搜索找到按钮: '{text}'")
-                            return button
-                except:
-                    continue
-        except:
-            pass
-        
-        # 方法2: 查找特定class的按钮
-        try:
-            primary_buttons = page.locator('button.btn-primary, button.btn-success')
-            if primary_buttons.count() > 0:
-                button = primary_buttons.first
-                if button.is_visible():
-                    self.log(f"✅ 服务器 {server_id} 通过class找到主要按钮")
-                    return button
-        except:
-            pass
-        
-        # 方法3: 执行JavaScript查找
-        try:
-            button = page.evaluate_handle('''() => {
-                const buttons = Array.from(document.querySelectorAll('button'));
-                return buttons.find(btn => 
-                    btn.offsetParent !== null && 
-                    btn.textContent.includes('시간')
-                );
-            }''')
-            
-            if button:
-                self.log(f"✅ 服务器 {server_id} 通过JavaScript找到按钮")
-                return button
-        except:
-            pass
-        
-        self.log(f"❌ 服务器 {server_id} 所有方法都未找到按钮")
-        return None
-
-    def click_and_check_result(self, page, button, server_id):
-        """点击按钮并检查结果"""
-        try:
-            if button.is_enabled():
-                # 点击前保存页面状态用于比较
-                before_click = page.content()
-                
-                self.log(f"✅ 服务器 {server_id} 按钮可点击，正在点击...")
-                button.click()
-                
-                # 等待页面响应
-                time.sleep(5)
-                
-                # 检查页面变化
-                after_click = page.content()
-                
-                # 检查是否出现错误消息
-                error_patterns = [
-                    "already renewed", "can't renew", "only once", 
-                    "이미", "한번", "불가능"
-                ]
-                
-                has_error = any(pattern in after_click.lower() for pattern in error_patterns)
-                
-                if has_error:
-                    self.log(f"ℹ️ 服务器 {server_id} 检测到重复续期提示")
-                    return f"{server_id}: already_renewed"
-                else:
-                    # 检查是否有成功消息
-                    success_patterns = ["success", "성공", "added", "추가됨"]
-                    has_success = any(pattern in after_click.lower() for pattern in success_patterns)
-                    
-                    if has_success:
-                        self.log(f"✅ 服务器 {server_id} 续期成功")
-                        return f"{server_id}: success"
-                    else:
-                        # 检查页面内容是否发生变化
-                        if before_click != after_click:
-                            self.log(f"⚠️ 服务器 {server_id} 页面已变化但无明确结果")
-                            return f"{server_id}: unknown_changed"
-                        else:
-                            self.log(f"⚠️ 服务器 {server_id} 页面无变化")
-                            return f"{server_id}: no_change"
-            else:
-                self.log(f"❌ 服务器 {server_id} 按钮不可点击")
-                return f"{server_id}: button_disabled"
-                
-        except Exception as e:
-            self.log(f"❌ 服务器 {server_id} 点击按钮时出错: {e}")
-            return f"{server_id}: click_error"
-
-    def debug_element_visibility(self, page, server_id):
-        """调试元素可见性"""
-        self.log(f"🔍 调试服务器 {server_id} 的元素可见性")
-        
-        # 检查按钮的各种状态
-        selectors = ['button:has-text("시간추가")', 'button:has-text("시간 추가")']
-        
-        for selector in selectors:
-            try:
-                element = page.locator(selector)
-                count = element.count()
-                visible = element.is_visible() if count > 0 else False
-                enabled = element.is_enabled() if count > 0 else False
-                
-                self.log(f"选择器 '{selector}': count={count}, visible={visible}, enabled={enabled}")
-                
-                if count > 0:
-                    text = element.first.text_content().strip()
-                    self.log(f"  文本内容: '{text}'")
-                    
-            except Exception as e:
-                self.log(f"选择器 '{selector}' 检查失败: {e}")
-                    
     def process_server(self, page, server_url):
         """处理单个服务器的续期操作"""
         server_id = server_url.split('/')[-1] if server_url else "unknown"
@@ -336,19 +198,76 @@ class WeirdhostLogin:
             # 访问服务器页面
             self.log(f"访问服务器页面: {server_url}")
             page.goto(server_url, wait_until="networkidle")
-            
-            # 添加详细的调试信息
-            self.debug_element_visibility(page, server_id)
+            time.sleep(3)
             
             # 检查是否已登录
             if not self.check_login_status(page):
                 self.log(f"服务器 {server_id} 未登录，尝试重新登录", "WARNING")
                 return f"{server_id}: login_failed"
             
-            # 执行续期操作
-            result = self.add_server_time(page, server_url)
-            return result  # 直接返回结果，不要再次添加 server_id
+            # 查找续期按钮
+            button_selectors = [
+                'button:has-text("시간추가")',
+                'button:has-text("시간 추가")',
+                '//button[contains(text(), "시간추가")]',
+                '//button[contains(text(), "시간 추가")]',
+            ]
             
+            renew_button = None
+            for selector in button_selectors:
+                try:
+                    if selector.startswith('//'):
+                        button = page.locator(f'xpath={selector}')
+                    else:
+                        button = page.locator(selector)
+                    
+                    if button.count() > 0 and button.first.is_visible():
+                        renew_button = button.first
+                        self.log(f"找到续期按钮: {selector}")
+                        break
+                except:
+                    continue
+            
+            if not renew_button:
+                # 尝试查找所有按钮
+                try:
+                    all_buttons = page.locator('button')
+                    for i in range(all_buttons.count()):
+                        button = all_buttons.nth(i)
+                        if button.is_visible():
+                            text = button.text_content()
+                            if text and "시간" in text:
+                                renew_button = button
+                                self.log("通过文本搜索找到续期按钮")
+                                break
+                except:
+                    pass
+            
+            if not renew_button:
+                self.log(f"服务器 {server_id} 未找到续期按钮")
+                return f"{server_id}: no_button_found"
+            
+            # 点击续期按钮
+            if renew_button.is_enabled():
+                self.log(f"点击续期按钮...")
+                renew_button.click()
+                time.sleep(5)
+                
+                # 简单的成功判断
+                page_content = page.content()
+                if "성공" in page_content or "success" in page_content.lower():
+                    self.log(f"服务器 {server_id} 续期成功")
+                    return f"{server_id}: success"
+                elif "이미" in page_content or "already" in page_content.lower():
+                    self.log(f"服务器 {server_id} 已经续期过了")
+                    return f"{server_id}: already_renewed"
+                else:
+                    self.log(f"服务器 {server_id} 续期结果未知")
+                    return f"{server_id}: unknown"
+            else:
+                self.log(f"服务器 {server_id} 续期按钮不可点击")
+                return f"{server_id}: button_disabled"
+                
         except Exception as e:
             self.log(f"处理服务器 {server_id} 时出错: {e}", "ERROR")
             return f"{server_id}: error"
@@ -363,6 +282,7 @@ class WeirdhostLogin:
         
         self.log(f"Cookie 认证可用: {has_cookie}")
         self.log(f"邮箱密码认证可用: {has_email}")
+        self.log(f"解析到的Cookie: {list(self.cookies_dict.keys())}")
         
         if not has_cookie and not has_email:
             self.log("没有可用的认证信息！", "ERROR")
@@ -386,19 +306,18 @@ class WeirdhostLogin:
                 
                 # 创建浏览器上下文
                 context = browser.new_context()
-                
-                # 创建页面
                 page = context.new_page()
-                page.set_default_timeout(90000)
+                page.set_default_timeout(60000)
                 
                 login_success = False
                 
                 # 方案1: 尝试 Cookie 登录
                 if has_cookie:
                     if self.login_with_cookies(context):
-                        # 访问任意页面检查登录状态
+                        # 访问首页检查登录状态
                         self.log("检查Cookie登录状态...")
-                        page.goto(self.url, wait_until="domcontentloaded")
+                        page.goto(self.url, wait_until="networkidle")
+                        time.sleep(3)
                         
                         if self.check_login_status(page):
                             self.log("✅ Cookie 登录成功！")
@@ -409,13 +328,7 @@ class WeirdhostLogin:
                 # 方案2: 如果 Cookie 登录失败，尝试邮箱密码登录
                 if not login_success and has_email:
                     if self.login_with_email(page):
-                        # 登录成功后访问首页
-                        self.log("检查邮箱密码登录状态...")
-                        page.goto(self.url, wait_until="domcontentloaded")
-                        
-                        if self.check_login_status(page):
-                            self.log("✅ 邮箱密码登录成功！")
-                            login_success = True
+                        login_success = True
                 
                 # 如果登录成功，依次处理每个服务器
                 if login_success:
@@ -425,47 +338,38 @@ class WeirdhostLogin:
                         self.log(f"服务器处理结果: {result}")
                         
                         # 在处理下一个服务器前等待一下
-                        time.sleep(5)
+                        time.sleep(3)
                 else:
                     self.log("❌ 所有登录方式都失败了", "ERROR")
-                    results = ["login_failed"] * len(self.server_list)
+                    results = ["login_failed"]
                 
                 browser.close()
                 return results
                 
         except TimeoutError as e:
             self.log(f"操作超时: {e}", "ERROR")
-            return ["error: timeout"] * len(self.server_list)
+            return ["error: timeout"]
         except Exception as e:
             self.log(f"运行时出错: {e}", "ERROR")
-            return ["error: runtime"] * len(self.server_list)
+            return ["error: runtime"]
     
     def write_readme_file(self, results):
         """写入README文件"""
         try:
-            # 获取东八区时间
             from datetime import datetime, timezone, timedelta
             beijing_time = datetime.now(timezone(timedelta(hours=8)))
             timestamp = beijing_time.strftime('%Y-%m-%d %H:%M:%S')
             
-            # 状态消息映射
             status_messages = {
                 "success": "✅ 续期成功",
-                "already_renewed": "⚠️ 已经续期过了",
+                "already_renewed": "⚠️ 已经续期过了", 
                 "no_button_found": "❌ 未找到续期按钮",
                 "button_disabled": "❌ 续期按钮不可点击",
-                "login_failed": "❌ 登录失败", 
+                "login_failed": "❌ 登录失败",
                 "error": "💥 运行出错",
-                "click_error": "💥 点击按钮出错",
-                "unknown_changed": "⚠️ 页面变化但结果未知",
-                "no_change": "⚠️ 页面无变化",
-                "error: no_auth": "❌ 无认证信息",
-                "error: no_servers": "❌ 无服务器配置",
-                "error: timeout": "⏰ 操作超时",
-                "error: runtime": "💥 运行时错误"
+                "unknown": "❓ 结果未知"
             }
             
-            # 创建README内容
             readme_content = f"""# Weirdhost 自动续期脚本
 
 **最后运行时间**: `{timestamp}` (北京时间)
@@ -474,28 +378,15 @@ class WeirdhostLogin:
 
 """
             
-            # 添加每个服务器的结果
             for result in results:
-                if ":" in result and not result.startswith("error:"):
-                    # 正确分割服务器ID和状态
-                    parts = result.split(":", 1)
-                    server_id = parts[0].strip()
-                    status = parts[1].strip() if len(parts) > 1 else "unknown"
-                    # 检查状态是否包含服务器ID
-                    if ":" in status:
-                        # 如果状态中还包含冒号，说明分割有问题，重新处理
-                        status_parts = status.split(":", 1)
-                        server_id = f"{server_id}:{status_parts[0]}"
-                        status = status_parts[1].strip() if len(status_parts) > 1 else "unknown"
-                        
-                    status_msg = status_messages.get(status, f"❓ 未知状态 ({status})")
+                if ":" in result:
+                    server_id, status = result.split(":", 1)
+                    status_msg = status_messages.get(status.strip(), f"❓ 未知状态 ({status})")
                     readme_content += f"- 服务器 `{server_id}`: {status_msg}\n"
                 else:
-                    # 处理错误状态
                     status_msg = status_messages.get(result, f"❓ 未知状态 ({result})")
                     readme_content += f"- {status_msg}\n"
             
-            # 写入README文件
             with open('README.md', 'w', encoding='utf-8') as f:
                 f.write(readme_content)
             
@@ -510,7 +401,6 @@ def main():
     print("🚀 Weirdhost 自动续期脚本启动")
     print("=" * 50)
     
-    # 创建登录器
     login = WeirdhostLogin()
     
     # 检查环境变量
@@ -518,25 +408,19 @@ def main():
         print("❌ 错误：未设置认证信息！")
         print("\n请在 GitHub Secrets 中设置以下任一组合：")
         print("\n方案1 - Cookie 认证：")
-        print("REMEMBER_WEB_COOKIE: 你的cookie值")
+        print("WEIRDHOST_COOKIES: pterodactyl_session=你的值; remember_web_59ba36ad=你的值")
         print("\n方案2 - 邮箱密码认证：")
         print("WEIRDHOST_EMAIL: 你的邮箱")
         print("WEIRDHOST_PASSWORD: 你的密码")
-        print("\n推荐使用 Cookie 认证，更稳定可靠")
         sys.exit(1)
     
-    # 检查服务器URL列表
     if not login.server_list:
         print("❌ 错误：未设置服务器URL列表！")
         print("\n请在 GitHub Secrets 中设置：")
-        print("WEIRDHOST_SERVER_URLS: https://hub.weirdhost.xyz/server/服务器ID1,https://hub.weirdhost.xyz/server/服务器ID2")
-        print("\n示例: https://hub.weirdhost.xyz/server/abc12345,https://hub.weirdhost.xyz/server/abc67890")
+        print("WEIRDHOST_SERVER_URLS: https://hub.weirdhost.xyz/server/你的服务器ID")
         sys.exit(1)
     
-    # 执行续期任务
     results = login.run()
-    
-    # 写入README文件
     login.write_readme_file(results)
     
     print("=" * 50)
@@ -544,8 +428,7 @@ def main():
     for result in results:
         print(f"  - {result}")
     
-    # 检查是否有完全失败的情况
-    if any("login_failed" in result or "error:" in result for result in results):
+    if any("login_failed" in result or "error" in result for result in results):
         print("❌ 续期任务有失败的情况！")
         sys.exit(1)
     else:
